@@ -17,7 +17,7 @@ use Sys::Syslog;
 
 {
     no strict "vars";
-    $VERSION = '0.07';
+    $VERSION = '0.07.2';
 }
 
 use constant HAVE_SORT_KEY_OID
@@ -30,6 +30,8 @@ my @attributes = qw<
     backend_fork
     backend_init
     backend_pipe
+    set_post_hook
+    father_postinit
     heap
     idle_count
     input
@@ -63,6 +65,7 @@ my %snmp_ext_type = (
     counter64   => "counter64",
     gauge       => "gauge",
     integer     => "integer",
+    integer32   => "integer32",
     ipaddr      => "ipaddress",
     ipaddress   => "ipaddress",
     netaddr     => "ipaddress",
@@ -71,6 +74,7 @@ my %snmp_ext_type = (
 #   opaque      => "opaque",
     string      => "string",
     timeticks   => "timeticks",
+    notif       => "notif",
 );
 
 
@@ -109,6 +113,8 @@ sub new {
         backend_collect => sub {},
         backend_fork    => 0,
         backend_init    => sub {},
+        set_post_hook   => sub {}, # executed in agent process
+        father_postinit => sub {},
         heap            => {},
         input           => \*STDIN,
         output          => \*STDOUT,
@@ -207,11 +213,13 @@ sub run {
 
             # parent setup
             $pipe->reader;  # declare this end of the pipe as the reader
-            $pipe->autoflush(1);
         }
 
-        my $io = IO::Select->new;
-        $io->add($self->input);
+	eval { $self->father_postinit->($self); 1 }
+		or croak "fatal: An error occurred while executing "
+			."the father post init callback: $@";
+
+        my $io = IO::Select->new($self->input);
         $self->output->autoflush(1);
 
         if ($backend_fork) {
@@ -219,9 +227,8 @@ sub run {
             $SIG{CHLD} = sub { $io->remove($pipe); waitpid($child, 0); };
         }
 
-
         # main loop
-        while ($needed and $counter > 0) {
+        while ($needed and $counter != 0) {
             my $start_time = time;
 
             # wait for some input data
@@ -230,12 +237,15 @@ sub run {
             for my $fh (@ready) {
                 # handle input data from netsnmpd
                 if ($fh == $self->input) {
-                    if (my $cmd = <$fh>) {
-                        $self->process_cmd(lc($cmd), $fh);
+                    my $cmd = sysreadline($fh);
+                    if (defined $cmd) {
+                        eval { $self->process_cmd(lc($cmd), $fh); 1 }
+                            or syslog "err", "%s", "An error occurred while executing "
+                                                    ."the command $cmd: $@";
                         $counter = $self->idle_count;
-                    }
-                    else {
-                        $needed = 0
+                    } else {
+                        syslog "debug", "%s", "EOF";
+                        $needed = 0;
                     }
                 }
 
@@ -280,6 +290,7 @@ sub run {
         }
 
         if ($backend_fork) {
+            syslog "debug", "%s", "Kill backend fork. needed=$needed, counter=$counter";
             kill TERM => $child;
             sleep 1;
             kill KILL => $child;
@@ -294,10 +305,12 @@ sub run {
 # ----------------
 sub run_backend_loop {
     my ($self) = @_;
+    open STDIN, '/dev/null'   or die "Can't read /dev/null: $!";
+    open STDOUT, '>>/dev/null' or die "Can't write to /dev/null: $!";
+    open STDERR, '>>/dev/null' or die "Can't write to /dev/null: $!";
 
     my $pipe = $self->backend_pipe;
     $pipe->writer;  # declare this end of the pipe as the writer
-    $pipe->autoflush(1);
 
     # execute the initialisation callback
     eval { $self->backend_init->($self); 1 }
@@ -323,11 +336,38 @@ sub run_backend_loop {
         select(undef, undef, undef, .000_001);
 
         # wait before next execution
-        my $delay = $self->refresh() - (time() - $start_time);
+        my $delay = $self->refresh - (time() - $start_time);
         sleep $delay;
     }
 }
 
+#
+# sysreadline()
+# -----------
+# A read line function that use sysread.
+# Friendly compatible with select
+sub sysreadline($) {
+    my ($fh) = @_;
+    my $line = '';
+    my $err;
+    while (1) {
+        my $c;
+        my $n = sysread($fh, $c, 1);
+        unless (defined $n) {
+            syslog "debug", "%s", "ERROR $!" unless defined $err;
+            $err = $!;
+            select (undef, undef, undef, 0.001);
+            next;
+        }
+        if ($n == 0) {
+            syslog "debug", "%s", "EOF";
+            return undef;
+        }
+        undef $err;
+        return $line if $c eq "\n";
+        $line .= $c;
+    }
+}
 
 #
 # add_oid_entry()
@@ -426,7 +466,24 @@ sub getnext_oid {
 # -------
 sub set_oid {
     my ($self, $req_oid, $value) = @_;
-    return SNMP_NOT_WRITABLE
+    my $node = \$self->oid_tree->{$req_oid};
+    unless (defined $$node) {
+        return (SNMP_NONE);
+    }
+    my ($type, $node_value) = @{$$node};
+    unless ($value =~ /^$type/) {
+        return (SNMP_WRONG_TYPE);
+    }
+    $value = substr($value, length($type));
+    my $string_quote_substitution = $type eq "string" ? '"': '';
+    $value =~ s/^\s*$string_quote_substitution//;
+    $value =~ s/$string_quote_substitution\s*$//;
+    $$node = [$type => $value];
+    eval { $self->set_post_hook->($self, $req_oid, $type, $value); 1 }
+        or croak "fatal: An error occurred while executing "
+                ."the set post hook callback: $@";
+
+    return (SNMP_NONE);
 }
 
 
@@ -449,7 +506,7 @@ sub process_cmd {
         my $n    = $dispatch->{$cmd}{nargs};
 
         while ($n-- > 0) {
-            chomp(my $arg = <$fh>);
+            chomp(my $arg = sysreadline($fh));
             push @args, $arg;
         }
 
@@ -462,7 +519,7 @@ sub process_cmd {
     }
 
     # output the result
-    $self->output->print(join "\n", @result, "");
+    $self->output->print(join ("\n", @result, ""));
 }
 
 
